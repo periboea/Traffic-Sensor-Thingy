@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
+#include <MQ135.h>
 
 // Lampu traffic 1
 #define R1_PIN 23
@@ -15,24 +16,32 @@
 
 // Lampu traffic 3
 #define R3_PIN 4
-#define Y3_PIN 0
+#define Y3_PIN 25
 #define G3_PIN 2
 
 // Sensors dan actuators
 #define DHTPIN 14
-#define DHTTYPE DHT11
+#define DHTTYPE DHT22   // Wokwi cuma punya DHT22. Ganti ke DHT11 kalau pakai DHT asli ya mas
 #define MQ135_PIN 34
-#define BUZZER_PIN 12
+#define BUZZER_PIN 26
 
-// Peripherals & synchronization
+// Konfigurasi waktu dan ambang batas
+const unsigned long PREHEAT_MS = 120000;   // 2 menit pre heat MQ135
+const int AQ_POOR_PPM = 600;               // di atas ini dianggap buruk
+const int GREEN_MS = 4000;
+const int YELLOW_MS = 1000;
+const int ALL_RED_MS = 1000;
+
+// Peripherals dan synchronization
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 DHT dht(DHTPIN, DHTTYPE);
-SemaphoreHandle_t xLCDMutex;
+MQ135 gasSensor(MQ135_PIN);
+SemaphoreHandle_t xSensorMutex;
 
-// Global shared air quality data
-volatile float tempVal = 0.0;
-volatile float humVal = 0.0;
-volatile int airQualityPpm = 0;
+// Data sensor yang dipakai bersama oleh SensorTask dan DisplayTask
+float tempVal = 0.0;
+float humVal = 0.0;
+int airQualityPpm = 0;
 
 // Task handlers
 void TaskTrafficLight(void *pvParameters);
@@ -42,115 +51,151 @@ void TaskDisplayBuzzer(void *pvParameters);
 void setup() {
   Serial.begin(115200);
 
-  // Initialize LED Pins
+  // Samakan resolusi ADC ESP32 dengan yang diharapkan library MQ135 (0 sampai 1023)
+  analogReadResolution(10);
+
+  // Initialize LED pins dan buzzer
   int pins[] = {R1_PIN, Y1_PIN, G1_PIN, R2_PIN, Y2_PIN, G2_PIN, R3_PIN, Y3_PIN, G3_PIN, BUZZER_PIN};
   for (int pin : pins) {
     pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
   }
 
-  // Initialize sensors & peripherals
   dht.begin();
   lcd.init();
   lcd.backlight();
 
-  // Create mutex for LCD resource protection
-  xLCDMutex = xSemaphoreCreateMutex();
+  // Mutex untuk melindungi data sensor
+  xSensorMutex = xSemaphoreCreateMutex();
 
-  // RTOS Tasks creation
   xTaskCreatePinnedToCore(TaskTrafficLight, "TrafficTask", 2048, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(TaskSensorRead,  "SensorTask",  2048, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(TaskDisplayBuzzer,"DisplayTask", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskSensorRead, "SensorTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskDisplayBuzzer, "DisplayTask", 4096, NULL, 1, NULL, 1);
 }
 
 void loop() {
-  // FreeRTOS handles execution; loop remains empty
   vTaskDelete(NULL);
 }
 
-// Helper function to set traffic light state
+// Set satu lane
 void setIntersection(int red, int yellow, int green, int r, int y, int g) {
   digitalWrite(red, r);
   digitalWrite(yellow, y);
   digitalWrite(green, g);
 }
 
-// Task 1: 3-way sequential traffic light control
+// Semua lane merah (fase all red)
+void allRed() {
+  setIntersection(R1_PIN, Y1_PIN, G1_PIN, 1, 0, 0);
+  setIntersection(R2_PIN, Y2_PIN, G2_PIN, 1, 0, 0);
+  setIntersection(R3_PIN, Y3_PIN, G3_PIN, 1, 0, 0);
+}
+
+// Task 1: lampu lalu lintas 3 lane dengan fase all red
 void TaskTrafficLight(void *pvParameters) {
   (void) pvParameters;
   for (;;) {
-    // Phase 1: Lane 1 GREEN, Lanes 2 & 3 RED
+    // Lane 1 hijau
+    allRed();
     setIntersection(R1_PIN, Y1_PIN, G1_PIN, 0, 0, 1);
-    setIntersection(R2_PIN, Y2_PIN, G2_PIN, 1, 0, 0);
-    setIntersection(R3_PIN, Y3_PIN, G3_PIN, 1, 0, 0);
-    vTaskDelay(pdMS_TO_TICKS(4000));
+    vTaskDelay(pdMS_TO_TICKS(GREEN_MS));
 
-    // Phase 1 Yellow
+    // Lane 1 kuning
     setIntersection(R1_PIN, Y1_PIN, G1_PIN, 0, 1, 0);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(YELLOW_MS));
 
-    // Phase 2: Lane 2 GREEN, Lanes 1 & 3 RED
-    setIntersection(R1_PIN, Y1_PIN, G1_PIN, 1, 0, 0);
+    // All red
+    allRed();
+    vTaskDelay(pdMS_TO_TICKS(ALL_RED_MS));
+
+    // Lane 2 hijau
     setIntersection(R2_PIN, Y2_PIN, G2_PIN, 0, 0, 1);
-    setIntersection(R3_PIN, Y3_PIN, G3_PIN, 1, 0, 0);
-    vTaskDelay(pdMS_TO_TICKS(4000));
+    vTaskDelay(pdMS_TO_TICKS(GREEN_MS));
 
-    // Phase 2 Yellow
+    // Lane 2 kuning
     setIntersection(R2_PIN, Y2_PIN, G2_PIN, 0, 1, 0);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(YELLOW_MS));
 
-    // Phase 3: Lane 3 GREEN, Lanes 1 & 2 RED
-    setIntersection(R1_PIN, Y1_PIN, G1_PIN, 1, 0, 0);
-    setIntersection(R2_PIN, Y2_PIN, G2_PIN, 1, 0, 0);
+    // All red
+    allRed();
+    vTaskDelay(pdMS_TO_TICKS(ALL_RED_MS));
+
+    // Lane 3 hijau
     setIntersection(R3_PIN, Y3_PIN, G3_PIN, 0, 0, 1);
-    vTaskDelay(pdMS_TO_TICKS(4000));
+    vTaskDelay(pdMS_TO_TICKS(GREEN_MS));
 
-    // Phase 3 Yellow
+    // Lane 3 kuning
     setIntersection(R3_PIN, Y3_PIN, G3_PIN, 0, 1, 0);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(YELLOW_MS));
+
+    // All red
+    allRed();
+    vTaskDelay(pdMS_TO_TICKS(ALL_RED_MS));
   }
 }
 
-// Task 2: read DHT11 and MQ-135 air quality sensor
+// Task 2: baca DHT dan MQ135, lalu tulis ke data bersama lewat mutex
 void TaskSensorRead(void *pvParameters) {
   (void) pvParameters;
   for (;;) {
+    // Baca dulu ke variabel lokal, lama dan tanpa lock
     float t = dht.readTemperature();
     float h = dht.readHumidity();
-    int analogGas = analogRead(MQ135_PIN);
+    float ppm = gasSensor.getPPM();
 
-    if (!isnan(t)) tempVal = t;
-    if (!isnan(h)) humVal = h;
-    airQualityPpm = map(analogGas, 0, 4095, 100, 1000); // Scaled representation
+    // Lock sebentar saja untuk menyalin ke data bersama
+    if (xSemaphoreTake(xSensorMutex, portMAX_DELAY) == pdTRUE) {
+      if (!isnan(t)) tempVal = t;
+      if (!isnan(h)) humVal = h;
+      if (isfinite(ppm)) airQualityPpm = (int)ppm;
+      xSemaphoreGive(xSensorMutex);
+    }
 
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
-// Task 3: update LCD & trigger audio alarm
+// Task 3: salin data bersama lewat mutex, lalu tampilkan di LCD dan bunyikan buzzer
 void TaskDisplayBuzzer(void *pvParameters) {
   (void) pvParameters;
   for (;;) {
-    if (xSemaphoreTake(xLCDMutex, portMAX_DELAY) == pdTRUE) {
-      // Row 0: temp and humidity
-      lcd.setCursor(0, 0);
-      lcd.print("T:");
-      lcd.print((int)tempVal);
-      lcd.print("C H:");
-      lcd.print((int)humVal);
-      lcd.print("%   ");
+    float t = 0;
+    float h = 0;
+    int ppm = 0;
 
-      // Row 1: air quality status
-      lcd.setCursor(0, 1);
-      if (airQualityPpm > 600) {
-        lcd.print("AQI: POOR!     ");
-        tone(BUZZER_PIN, 1000, 200); // Alert sound
-      } else {
-        lcd.print("AQI: GOOD      ");
-        noTone(BUZZER_PIN);
-      }
-      xSemaphoreGive(xLCDMutex);
+    // Lock sebentar saja untuk menyalin data ke variabel lokal
+    if (xSemaphoreTake(xSensorMutex, portMAX_DELAY) == pdTRUE) {
+      t = tempVal;
+      h = humVal;
+      ppm = airQualityPpm;
+      xSemaphoreGive(xSensorMutex);
     }
+
+    // Baris 0: suhu dan kelembapan
+    lcd.setCursor(0, 0);
+    lcd.print("T:");
+    lcd.print((int)t);
+    lcd.print("C H:");
+    lcd.print((int)h);
+    lcd.print("%   ");
+
+    // Baris 1: status udara atau pengingat pre heat
+    lcd.setCursor(0, 1);
+    unsigned long now = millis();
+    if (now < PREHEAT_MS) {
+      int secondsLeft = (PREHEAT_MS - now) / 1000;
+      lcd.print("MQ135 heat ");
+      lcd.print(secondsLeft);
+      lcd.print("s   ");
+      noTone(BUZZER_PIN);
+    } else if (ppm > AQ_POOR_PPM) {
+      lcd.print("AQI: POOR!      ");
+      tone(BUZZER_PIN, 1000, 200);
+    } else {
+      lcd.print("AQI: GOOD       ");
+      noTone(BUZZER_PIN);
+    }
+
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
